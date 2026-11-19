@@ -1,313 +1,344 @@
-"""GTA VI trophy rarity forecaster (make.fun gta6-trophy-rarity-forecast-01).
+#!/usr/bin/env python3
+"""GTA VI trophy rarity forecaster v2 — earners x players decomposition with a
+refresh-aware, backtest-calibrated spread.
 
-Model, in plain words
---------------------
-An earn rate is a ratio: earners / players tracked. Both sides move in launch
-week -- new players join Exophase tracking (diluting every rate) while the
-players already there earn more trophies (lifting rates). Forecasting the
-ratio directly confounds the two, so this program forecasts each side
-separately and divides:
+Median: forecast earners and players separately, then divide. log(players) is
+fit against ln(1 + hours since release); each trophy's log(earners) is fit the
+same way with its slope shrunk 30% toward the players slope (a trophy's earners
+cannot outgrow the player base forever). The median is anchored to the last
+read and capped to 3 logit units of movement.
 
-  * players tracked: log(N) is fitted by least squares against
-    ln(1 + hours since release) over the recent reads, and read at the
-    target;
-  * earners per trophy: E = rate x N / 100 is fitted the same way, with its
-    slope shrunk 30% of the way toward the players' slope (rates stabilise;
-    a trophy's earners cannot keep outgrowing the player base for long);
-  * the median rate is 100 x E_hat / N_hat, capped so earners never exceed
-    players and the move from the last read stays within 3 logit units.
+Spread (the v2 fix): the total logit sigma combines, in quadrature, the direct
+log-rate fit's residual error, a random walk growing with the horizon, a
+refresh-shock term (Exophase refreshes move rates in jumps; when the history
+is frozen the next refresh is unobserved, so the band must span it), and a
+disagreement penalty between the decomposition median and the direct-trend
+median. A global multiplier k calibrates the whole band so the 90% interval
+covers about 90% in a synthetic backtest whose dynamics differ from this
+model's (logistic adoption, per-player earn times, Poisson refreshes).
 
-The spread is honest about what a multi-day extrapolation does not know: the
-prediction error of a direct log-rate trend fit (which sees the same scatter
-the decomposition does), a random-walk term that grows with the horizon, a
-term for disagreement between the decomposition median and the direct-trend
-median, and a floor. Trophies with too little history fall back to
-persistence with a wider band; a frozen history (the practice cases) falls
-back to persistence entirely.
-
-Reads are cleaned before fitting: consecutive identical reads (Exophase
-had not refreshed) count once, and at most one read per hour is kept, so a
-10-minute recorder does not pretend to be 6 independent observations an
-hour. Only the last 48 hours of reads are fitted.
-
-Everything is deterministic standard-library arithmetic: two runs on the
-same case write the same bytes. No network, no model calls, no randomness.
-
-Run: mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
-Grader: python3 -P -s /bot/main.py, one case in /input, forecast to /output.
+Stdlib only, no network, no clock, deterministic: two runs are byte-identical.
 """
-
 import json
 import math
 import os
+import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+Z = (-1.6448536269514722, -0.6744897501960817, 0.0,
+     0.6744897501960817, 1.6448536269514722)
 
-# The quantile levels the contest scores, in the order each row lists them.
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each level.
-Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
-
-# Release day, the origin of the log-time axis (same origin the house curve
-# baseline uses, so the two models are comparable).
-ORIGIN = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
-
-# Fit window: only reads this recent (hours before the checkpoint) are used.
-WINDOW_HOURS = 48.0
-# Thinning: at most one read per hour bucket is kept for fitting.
-THIN_MINUTES = 60.0
-# Minimum reads for a least-squares fit (fewer: fall back to persistence).
-MIN_POINTS = 3
-# Slope shrinkage for earners: b* = SHRINK * b_fit + (1 - SHRINK) * b_players.
-SHRINK = 0.7
-# Random-walk process noise, in logit units per square-root day. Set to 0.15
-# after a synthetic backtest (three launch-week scenarios): 0.20 was
-# measurably over-wide (90% coverage 0.96), 0.10 scored better still in the
-# simulator, but the simulator is tamer than the real week (no weekend
-# surge, no Exophase quirks), so 0.15 keeps a margin for genuine shocks.
-SIGMA_RW = 0.15
-# Minimum spread, in logit units: no forecast claims to know more than this.
-SIGMA_FLOOR = 0.10
-# Maximum spread: bands wider than this pay more in width than they save.
-SIGMA_CAP = 1.20
-# Sanity cap on how far the median may move from the last read, logit units.
-MAX_LOGIT_MOVE = 3.0
-# Extra spread (added in quadrature) for a trophy with 1-2 positive reads.
-SIGMA_THIN_DATA = 0.30
-# Extra spread for a trophy with no positive read at all (it may emerge).
-SIGMA_NO_DATA = 0.50
+# --- Tuned constants (synthetic backtest, 48 cases, 3 scenarios, FIXED
+#     seeds — reproducible across runs; see the builder's scratch design.md
+#     + backtest.py). Stage-1 sweep (SIGMA_RW x CAL_K x SIGMA_SHOCK_FROZEN)
+#     then stage 2 scored on the 4.5-day kinds only — the final IS a 4.5-day
+#     case; the frozen 90-minute kind is the practice regime and does not
+#     pay. Pick: SIGMA_RW 0.15 (0.10/0.15/0.20 differ by <0.005 loss),
+#     CAL_K 1.50, shock 2.2: 4.5d pinball loss 0.7206, coverage_90 0.911
+#     (baselines pooled: house 1.92, house-curve 1.36, persistence 2.49).
+#     k=1.25 ties on 4.5d loss (0.7210) but under-covers (0.826); k=1.50
+#     matches the loss and lands coverage on the 0.90 target, and it was
+#     the robust pick across two independent game draws (cov 0.911 / 0.931).
+#     Loss rises past k=1.50 (k=2.00 -> 0.7596), so 1.50 is an interior
+#     optimum. The frozen shock helps 4.5d loss monotonically to 2.2 (rare
+#     trophies frozen for 48h genuinely jump); gains past 2.2 are within
+#     noise, so the sweep stops there.
+SIGMA_RW = 0.15            # random-walk sigma per sqrt(day)
+SIGMA_FIT_DEFAULT = 0.35   # fit-error sigma when too few points to fit
+SIGMA_SHOCK_FROZEN = 2.2   # refresh-shock sigma, frozen/thin history
+SIGMA_SHOCK_MOVING = 0.3   # refresh-shock sigma, history shows movement
+SIGMA_FLOOR = 0.10         # never claim more certainty than this
+SIGMA_TOP = 0.35           # spread for a trophy sitting at 100%
+CAL_K = 1.50               # global calibration multiplier on sigma
+SLOPE_KEEP = 0.7           # keep 70% of a trophy slope's deviation (30% shrink)
+MOVE_CAP = 3.0             # max median move from last read, logit units
+FIT_WINDOW_HOURS = 48.0    # only the last 48h of reads are fitted
+MAX_PLAYER_GROWTH_LOG = 3.0  # cap on log player growth over the horizon
 
 
-def clamp_rate(x: float) -> float:
-    """A percent clamped to the range the scorer's logit is defined on."""
-    return min(99.99, max(0.01, x))
+def parse_time(text):
+    """ISO 8601 (with Z) -> aware datetime, or None."""
+    if not isinstance(text, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
-def logit(pct: float) -> float:
-    p = clamp_rate(pct) / 100.0
+def logit_pct(rate):
+    """logit of a percent rate, clamped to [0.01, 99.99] like the scorer."""
+    p = min(99.99, max(0.01, float(rate))) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def inv_logit(lg: float) -> float:
-    """Logit back to percent, guarded against overflow either way."""
-    if lg >= 0:
-        return 100.0 / (1.0 + math.exp(-lg))
-    e = math.exp(lg)
-    return 100.0 * e / (1.0 + e)
-
-
-def round4(x: float):
-    """x rounded to 4 decimals, half up (as the house baseline rounds it)."""
-    scaled = x * 10000
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 10000
-    return int(value) if value.is_integer() else value
-
-
-def parse_time(text: str) -> datetime:
-    return datetime.fromisoformat(text.replace("Z", "+00:00"))
-
-
-def log_time(t: datetime) -> float:
-    """ln(1 + hours since release), floored so pre-release reads stay valid."""
-    hours = (t - ORIGIN).total_seconds() / 3600.0
-    return math.log(max(1.0 + hours, 0.01))
+def sigmoid(x):
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return e / (1.0 + e)
 
 
 def ols(xs, ys):
-    """Least squares y = a + b x. Returns (a, b, s2, xbar, sxx, n) or None.
-
-    s2 is the residual variance (RSS / (n - 2)); None when the fit is
-    degenerate (too few points or no spread in x).
-    """
+    """Least squares y ~ a + b*x. Returns (a, b, resid_sd, n) or None when
+    the fit is undefined (fewer than 2 distinct x). resid_sd is Bessel
+    corrected (n-2 dof) and None when n < 3."""
     n = len(xs)
-    if n < MIN_POINTS:
+    if n < 2:
         return None
-    xbar = sum(xs) / n
-    ybar = sum(ys) / n
-    sxx = sum((x - xbar) ** 2 for x in xs)
-    if sxx <= 1e-12:
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 0:
         return None
-    sxy = sum((x - xbar) * (y - ybar) for x, y in zip(xs, ys))
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
     b = sxy / sxx
-    a = ybar - b * xbar
-    rss = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys))
-    s2 = rss / (n - 2) if n > 2 else 0.0
-    return (a, b, s2, xbar, sxx, n)
+    a = my - b * mx
+    sd = None
+    if n >= 3:
+        rss = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys))
+        sd = math.sqrt(rss / (n - 2))
+    return (a, b, sd, n)
 
 
-def pred_se(fit, x_star: float) -> float:
-    """Prediction standard error of a fitted line at x_star.
-
-    sqrt(s2 * (1 + 1/n + (x* - xbar)^2 / Sxx)): the usual prediction
-    interval, which widens as the target moves away from the fitted data.
-    """
-    a, b, s2, xbar, sxx, n = fit
-    if s2 <= 0.0:
-        s2 = 1e-6
-    return math.sqrt(s2 * (1.0 + 1.0 / n + (x_star - xbar) ** 2 / sxx))
-
-
-def clean_reads(history, checkpoint: datetime):
-    """Dedupe, thin and window the reads; returns [(time, players, rates)]."""
+def clean_reads(history, origin, checkpoint):
+    """Dedupe identical consecutive reads, thin to at most one read per hour
+    (keep the latest in each hour bucket), keep only the last 48h before the
+    checkpoint. Returns a list of (x, read) with x = ln(1 + hours since
+    origin), oldest first."""
     rows = []
+    prev_key = None
     for read in history:
+        at = parse_time(read.get("at") or read.get("slot"))
+        if at is None:
+            continue
         players = read.get("players_tracked")
         rates = read.get("rates")
-        if players is None or players <= 0 or rates is None:
+        if not isinstance(players, (int, float)) or players <= 0:
             continue
-        try:
-            when = parse_time(read["at"])
-        except (KeyError, ValueError):
+        if not isinstance(rates, list):
             continue
-        rows.append((when, players, tuple(rates)))
-    rows.sort(key=lambda r: r[0])
-    # Consecutive identical reads are one observation (no refresh happened).
-    deduped = []
-    for row in rows:
-        if deduped and deduped[-1][1] == row[1] and deduped[-1][2] == row[2]:
-            continue
-        deduped.append(row)
-    # At most one read per hour: the last one in each hour bucket.
-    thinned = {}
-    for row in deduped:
-        bucket = int(row[0].timestamp() // (THIN_MINUTES * 60))
-        thinned[bucket] = row
-    thinned = [thinned[k] for k in sorted(thinned)]
-    # The recent window; fall back to everything if it leaves too little.
-    cutoff = checkpoint.timestamp() - WINDOW_HOURS * 3600.0
-    windowed = [r for r in thinned if r[0].timestamp() >= cutoff]
-    return windowed if len(windowed) >= MIN_POINTS else thinned
+        key = (players, tuple(rates))
+        if key == prev_key:
+            continue  # Exophase had not refreshed yet: same page again
+        prev_key = key
+        hours = (at - origin).total_seconds() / 3600.0
+        if hours < 0:
+            hours = 0.0
+        rows.append((hours, read))
+    # Last 48h before the checkpoint.
+    if checkpoint is not None:
+        rows = [r for r in rows
+                if (checkpoint - origin).total_seconds() / 3600.0 - r[0]
+                <= FIT_WINDOW_HOURS]
+    # One read per hour bucket: keep the latest in each bucket.
+    by_hour = {}
+    for hours, read in rows:
+        by_hour[int(hours)] = (hours, read)
+    out = []
+    for hours in sorted(by_hour):
+        h, read = by_hour[hours]
+        out.append((math.log1p(h), read))
+    return out
 
 
-def forecast_case(case: dict, name: str) -> dict:
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
-    trophies = case["trophies"]
+def forecast_case(case):
+    """Forecast one case dict -> {"trophies": [{"id": n, "q": [...]}, ...]}."""
+    trophies = case.get("trophies") or []
     history = case.get("history") or []
-    horizon_days = case["horizon_minutes"] / 1440.0
-    rw = SIGMA_RW * math.sqrt(max(horizon_days, 0.0))
+    checkpoint = parse_time(case.get("at"))
+    target = parse_time(case.get("target"))
+    horizon_days = None
+    hm = case.get("horizon_minutes")
+    if isinstance(hm, (int, float)) and hm > 0:
+        horizon_days = hm / 1440.0
+    if horizon_days is None and checkpoint is not None and target is not None:
+        horizon_days = (target - checkpoint).total_seconds() / 86400.0
+    if horizon_days is None or horizon_days <= 0:
+        horizon_days = 1.0
 
-    if not history:
-        # No data at all: a valid but maximally uncertain forecast.
-        rows = []
-        for trophy in trophies:
-            rows.append({"id": trophy["id"], "q": [round4(inv_logit(0.0 + z * SIGMA_CAP)) for z in Z]})
-        return {"trophies": rows}
+    game = case.get("game") or {}
+    origin = None
+    rel = game.get("release_date")
+    if isinstance(rel, str):
+        origin = parse_time(rel + "T00:00:00Z") if "T" not in rel else parse_time(rel)
+    if origin is None and history:
+        origin = parse_time(history[0].get("at") or history[0].get("slot"))
+    if origin is None:
+        origin = checkpoint or datetime(2026, 11, 19, tzinfo=timezone.utc)
 
-    checkpoint = parse_time(case["at"])
-    target = parse_time(case["target"])
-    x_star = log_time(target)
-    reads = clean_reads(history, checkpoint)
-    last = history[-1]
-    last_rates = last.get("rates") or []
+    if target is not None:
+        x_target = math.log1p(max(0.0, (target - origin).total_seconds() / 3600.0))
+    else:
+        x_target = math.log1p(max(0.0, (checkpoint - origin).total_seconds() / 3600.0)
+                              + horizon_days * 24.0)
 
-    # --- players model: log(N) against log-time -------------------------
+    cleaned = clean_reads(history, origin, checkpoint)
+
+    # --- Players fit: log(N) vs x.
+    n_last = None
+    if history:
+        for read in reversed(history):
+            p = read.get("players_tracked")
+            if isinstance(p, (int, float)) and p > 0:
+                n_last = float(p)
+                break
+    if n_last is None:
+        n_last = 1.0
+    n_hat = n_last
+    b_players = 0.0
     players_fit = None
-    n_hat = None
-    se_n = None
-    if len(reads) >= MIN_POINTS:
-        xs = [log_time(r[0]) for r in reads]
-        ys = [math.log(r[1]) for r in reads]
+    if len(cleaned) >= 2:
+        xs = [x for x, _ in cleaned]
+        ys = [math.log(float(r["players_tracked"])) for _, r in cleaned]
         players_fit = ols(xs, ys)
-        if players_fit is not None:
-            a, b, _, _, _, _ = players_fit
-            n_hat = math.exp(a + b * x_star)
-            # Players tracked never falls, and will not octuple in a week.
-            n_hat = min(max(n_hat, reads[-1][1]), reads[-1][1] * 8.0)
-            se_n = pred_se(players_fit, x_star)
-    if n_hat is None:
-        n_hat = reads[-1][1] if reads else last.get("players_tracked") or 1
-    b_players = players_fit[1] if players_fit is not None else 0.0
+    if players_fit is not None:
+        a_n, b_n, _, _ = players_fit
+        b_players = b_n
+        log_n_hat = a_n + b_n * x_target
+        log_n_hat = max(math.log(n_last),
+                        min(log_n_hat, math.log(n_last) + MAX_PLAYER_GROWTH_LOG))
+        n_hat = math.exp(log_n_hat)
 
-    # --- per-trophy forecasts -------------------------------------------
     rows = []
-    for i, trophy in enumerate(trophies):
-        last_rate = last_rates[i] if i < len(last_rates) else None
-        if last_rate is None:
-            last_rate = 0.0
-        last_logit = logit(last_rate)
+    for idx, trophy in enumerate(trophies):
+        tid = trophy.get("id", idx + 1)
+        # Last observed rate for this trophy.
+        r_last = None
+        for read in reversed(history):
+            rates = read.get("rates") or []
+            if idx < len(rates) and rates[idx] is not None:
+                r_last = float(rates[idx])
+                break
+        if r_last is None:
+            r_last = 0.0
 
-        # Positive reads for this trophy: (x, earners, rate).
-        points = []
-        for when, players, rates in reads:
-            if i >= len(rates) or rates[i] is None or rates[i] <= 0:
-                continue
-            points.append((log_time(when), rates[i] * players / 100.0, rates[i]))
-        n_pos = len(points)
+        # Per-trophy series over the cleaned reads.
+        series = []  # (x, rate, players)
+        for x, read in cleaned:
+            rates = read.get("rates") or []
+            if idx < len(rates) and rates[idx] is not None:
+                series.append((x, float(rates[idx]),
+                               float(read["players_tracked"])))
+        distinct_rates = len(set(r for _, r, _ in series))
 
-        median_logit = last_logit
-        se_rate = None
-        direct_logit = None
-        extra2 = 0.0
-
-        if n_pos >= MIN_POINTS and players_fit is not None:
-            xs = [p[0] for p in points]
-            # Earners fit, slope shrunk toward the players' slope, line
-            # re-anchored through the data's centre.
-            ys_e = [math.log(p[1]) for p in points]
-            fit_e = ols(xs, ys_e)
+        # --- Earners fit with slope shrinkage toward the players slope.
+        e_last = max(0.5, r_last / 100.0 * n_last)
+        x_last = series[-1][0] if series else 0.0
+        b_earn = 0.0
+        if len(series) >= 2:
+            xs = [x for x, _, _ in series]
+            ys = [math.log(max(0.5, r / 100.0 * n)) for _, r, n in series]
+            fit_e = ols(xs, ys)
             if fit_e is not None:
-                _, b_e, _, xbar_e, _, _ = fit_e
-                ybar_e = sum(ys_e) / len(ys_e)
-                b_star = SHRINK * b_e + (1.0 - SHRINK) * b_players
-                a_star = ybar_e - b_star * xbar_e
-                e_hat = math.exp(a_star + b_star * x_star)
-                # Earners never decrease and never exceed the players.
-                e_max = max(p[1] for p in points)
-                e_hat = min(max(e_hat, e_max), 0.999 * n_hat)
-                rate_hat = 100.0 * e_hat / n_hat
-                median_logit = logit(rate_hat)
-            # Direct log-rate fit: its prediction error calibrates the
-            # spread, and its median flags disagreement with the ratio.
-            ys_r = [math.log(p[2]) for p in points]
-            fit_r = ols(xs, ys_r)
-            if fit_r is not None:
-                a_r, b_r, _, _, _, _ = fit_r
-                se_rate = pred_se(fit_r, x_star)
-                direct_logit = logit(math.exp(a_r + b_r * x_star))
-        elif n_pos > 0:
-            extra2 = SIGMA_THIN_DATA ** 2
+                b_earn = b_players + SLOPE_KEEP * (fit_e[1] - b_players)
+        e_hat = math.exp(math.log(e_last) + b_earn * (x_target - x_last))
+        e_hat = min(e_hat, n_hat)
+        median = 100.0 * e_hat / n_hat if n_hat > 0 else r_last
+
+        # Movement cap: at most MOVE_CAP logit units from the last read.
+        lo = logit_pct(r_last) - MOVE_CAP
+        hi = logit_pct(r_last) + MOVE_CAP
+        median = 100.0 * sigmoid(min(hi, max(lo, logit_pct(median))))
+        median = min(99.99, max(0.01, median))
+
+        # --- Direct log-rate fit: residual error + disagreement.
+        sigma_fit = SIGMA_FIT_DEFAULT
+        m_direct = r_last
+        if len(series) >= 2:
+            xs = [x for x, _, _ in series]
+            ys = [logit_pct(r) for _, r, _ in series]
+            fit_d = ols(xs, ys)
+            if fit_d is not None:
+                a_d, b_d, sd_d, _ = fit_d
+                m_direct = 100.0 * sigmoid(a_d + b_d * x_target)
+                if sd_d is not None:
+                    sigma_fit = sd_d
+        sigma_disagree = abs(logit_pct(median) - logit_pct(m_direct)) / 2.0
+
+        # --- Refresh shock: frozen history means the next refresh is unseen.
+        if distinct_rates < 3:
+            sigma_shock = SIGMA_SHOCK_FROZEN
         else:
-            extra2 = SIGMA_NO_DATA ** 2
+            sigma_shock = SIGMA_SHOCK_MOVING
+        sigma_rw = SIGMA_RW * math.sqrt(horizon_days)
 
-        # The median may not run away from the last read.
-        median_logit = min(max(median_logit, last_logit - MAX_LOGIT_MOVE),
-                           last_logit + MAX_LOGIT_MOVE)
+        sigma = CAL_K * math.sqrt(sigma_fit ** 2 + sigma_rw ** 2
+                                  + sigma_shock ** 2 + sigma_disagree ** 2)
+        sigma = max(SIGMA_FLOOR, sigma)
 
-        # --- spread ------------------------------------------------------
-        var = SIGMA_FLOOR ** 2 + rw ** 2 + extra2
-        if se_rate is not None:
-            var += se_rate ** 2
-        elif se_n is not None:
-            var += se_n ** 2 + 0.09  # players error plus an assumed earner error
-        else:
-            var += 0.09
-        if direct_logit is not None:
-            var += (0.25 * abs(median_logit - direct_logit)) ** 2
-        sigma = min(math.sqrt(var), SIGMA_CAP)
+        # Trophy sitting at 100%: it stayed at 100% through the big launch
+        # refresh, so keep the median pinned with a small spread.
+        if r_last >= 99.99:
+            median = 99.99
+            sigma = SIGMA_TOP
 
-        rows.append({
-            "id": trophy["id"],
-            "q": [round4(inv_logit(median_logit + z * sigma)) for z in Z],
-        })
+        centre = logit_pct(median)
+        qs = []
+        prev = -1.0
+        for z in Z:
+            q = round(100.0 * sigmoid(centre + z * sigma), 4)
+            q = min(100.0, max(0.0, q))
+            if q < prev:
+                q = prev
+            prev = q
+            qs.append(q)
+        rows.append({"id": tid, "q": qs})
     return {"trophies": rows}
 
 
-def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Every case file, in name order, so two runs write the same bytes.
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+def persistence_fallback(case):
+    """Valid-but-dumb forecast: every quantile equals the last read's rate.
+    Only used if the main forecast raises; a valid case beats a crash."""
+    trophies = case.get("trophies") or []
+    history = case.get("history") or []
+    rows = []
+    for idx, trophy in enumerate(trophies):
+        r_last = 0.0
+        for read in reversed(history):
+            rates = read.get("rates") or []
+            if idx < len(rates) and rates[idx] is not None:
+                r_last = float(rates[idx])
+                break
+        r_last = min(100.0, max(0.0, r_last))
+        rows.append({"id": trophy.get("id", idx + 1), "q": [r_last] * 5})
+    return {"trophies": rows}
+
+
+def main():
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    try:
+        names = sorted(n for n in os.listdir(in_dir) if n.endswith(".in"))
+    except OSError:
+        return 0
+    os.makedirs(out_dir, exist_ok=True)
+    for name in names:
+        path = os.path.join(in_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                case = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        try:
+            result = forecast_case(case)
+        except Exception:
+            try:
+                result = persistence_fallback(case)
+            except Exception:
+                continue
+        out_path = os.path.join(out_dir, name[:-3] + ".out")
+        try:
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(result, fh, separators=(",", ":"))
+                fh.write("\n")
+        except OSError:
+            continue
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
